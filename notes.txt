@@ -1,0 +1,66 @@
+Kurz vorweg: Das ist ein sauber definiertes, öffentlich publiziertes Forschungssetup (EMSEC/TEMPEST-Restauration in einer kontrollierten Testumgebung mit Ground Truth). Genau dafür ist DeepTempest gebaut. Hier der Rundumschlag.
+
+1. Was DeepTempest eigentlich ist
+DeepTempest ist eine Erweiterung von gr-tempest (dem klassischen Van-Eck-Phreaking-Ansatz in GNU Radio), entwickelt an der Universidad de la República in Montevideo. Die Kernidee:
+
+Ein HDMI-Kabel strahlt beim Übertragen des Bildsignals ungewollt elektromagnetisch ab. Mit einem SDR fängst du diese Emanation ab.
+gr-tempest rekonstruiert daraus ein grobes, verrauschtes Graustufenbild — bei reinem gr-tempest liegt die Character Error Rate (CER) bei ~90 %, Text ist also praktisch unlesbar.
+DeepTempest hängt hinten ein neuronales Netz dran, das dieses verrauschte Bild „aufräumt". Damit sinkt die CER auf unter 30 % — aus grauem Matsch wird lesbarer Text.
+
+Der eigentlich clevere Trick der Uruguayer: Sie überspringen die AM-Demodulation, die alle früheren TempestSDR-basierten Arbeiten benutzen (und die das Signal zusätzlich verzerrt), und lernen stattdessen direkt von den komplexen IQ-Samples auf das Originalbild zu mappen. Das ist der entscheidende Punkt für dich: ACM Other conferences
+Warum HDMI schwerer ist als das alte VGA-TEMPEST: HDMI nutzt eine 10-Bit-TMDS-Kodierung, die zu einer viel größeren Bandbreite und einem nichtlinearen Zusammenhang zwischen beobachtetem Signal und Pixel-Intensität führt. Deshalb versagen die alten analogen Ansätze bei Digitalvideo — und deshalb braucht man ein gelerntes Modell, das diese nichtlineare Abbildung invertiert. Man behandelt es formal als inverses Problem: „Gegeben das empfangene Signal, was war das Originalbild?" arXiv
+
+2. DRUNet — das Netz dahinter
+DRUNet (Denoising Residual U-Net) kommt aus dem KAIR-Repository von Kai Zhang („Plug-and-Play Image Restoration with Deep Denoiser Prior"). Architektur in einem Satz: eine U-Net-Struktur (Encoder-Decoder mit Skip-Connections) mit ResNet-Blöcken in jeder Ebene, als bias-freier Denoiser ausgelegt.
+Warum das für dein Problem passt:
+
+Die U-Net-Skips erhalten feine Kanten (kritisch für Text) über mehrere Auflösungsstufen.
+Die Residual-Blöcke machen das Netz tief trainierbar, ohne Detailverlust.
+Es ist ein reiner Image-to-Image-Restaurator — genau die Form „verrauschtes Bild rein, sauberes Bild raus".
+
+DeepTempest adaptiert DRUNet so, dass es die komplexwertigen Daten frisst (Real- und Imaginärteil als Eingangskanäle) statt eines demodulierten Graustufenbilds. Das ist der Unterschied zum Standard-DRUNet.
+Nebenbei: In der Literatur gibt es bereits Weiterentwicklungen (z. B. ein attention-enhanced DRUNet mit EMA-Modul in den Skip-Connections), die PSNR/SSIM/CER weiter verbessern. Für den Anfang bleib beim Original — das ist die dokumentierte, funktionierende Baseline.
+
+3. Deine drei Frequenzen — kurz eingeordnet
+Das passt exakt und ist kein Zufall:
+FrequenzWas es ist148,5 MHzPixeltakt von 1080p60 (Fundamentale)297 MHz2. Harmonische (×2)445,5 MHz3. Harmonische (×3)
+1920×1080 @ 60 Hz hat nach CEA-861-Timing einen Pixeltakt von genau 148,5 MHz. Deine drei Frequenzen sind also Pixeltakt × 1, 2, 3. Die Bildinformation steckt in den Seitenbändern rund um jede dieser Harmonischen.
+Praktische Empfehlung zur Frequenzwahl: Das DeepTempest-Paper hat für ihr 1600×900-Setup auf der 3. Harmonischen (324 MHz) aufgenommen. Übertragen auf 1080p60 ist deine 3. Harmonische die 445,5 MHz — fang damit an, weil du damit ihr erprobtes Setup spiegelst. Höhere Harmonische liefern oft schärfere Kanten (besser für Text), die Fundamentale hat mehr Energie. Wenn dein SDR es hergibt, kannst du später alle drei aufnehmen und kombinieren (MIMO-artig) — das verbessert nachweislich den SNR, ist aber Ausbaustufe 2.
+
+4. Lokale KI aufsetzen — der konkrete Weg
+Das Repo ist genau für deinen Fall gebaut: Es hat zwei Teile — gr-tempest (Capture) und end-to-end (Training/Inferenz mit DRUNet).
+Hardware (das „lokale" in lokaler KI):
+
+Eine NVIDIA-GPU ist Pflicht fürs Training. Ideal 24 GB (RTX 3090/4090), machbar ab 12 GB, wenn du auf Patches statt Vollbildern trainierst (z. B. 256×256-Ausschnitte).
+Genug RAM/SSD — der Original-Datensatz ist ~7 GB, deine eigenen Captures kommen dazu.
+
+Software-Umgebung (getestet auf Ubuntu 22.04/24.04):
+bashgit clone https://github.com/emidan19/deep-tempest.git
+sudo apt update && sudo apt install tesseract-ocr   # OCR für die CER-Metrik
+
+conda create -n deeptempest python=3.12
+conda activate deeptempest
+conda env update --file tempest_conda.yml
+
+pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+pip install pybind11==2.13.6
+pip install --no-build-isolation git+https://github.com/sfernandezr/fastwer.git
+Wichtig: Für den Capture-Teil musst du die modifizierte gr-tempest-Version aus diesem Repo nehmen (nicht das Original), sonst passt die Signalkette nicht. Danach die .grc-Flowgraphs einmal ausführen, um die Hierblocks zu aktivieren.
+
+5. Der Trainings-Workflow — und wo die eigentliche Arbeit steckt
+Dein großer Vorteil: In der Testumgebung hast du Originalbild + Empfangsbild als Paar. Das ist überwachtes Lernen in Reinform — genau das, was DRUNet braucht. Aber:
+Das schwierigste Problem ist die Ausrichtung (Alignment). Damit das Netz lernen kann, muss jedes empfangene Bild pixelgenau auf sein Ground-Truth-Original registriert sein. Das empfangene Bild ist verschoben, skaliert, driftet zeitlich. Wenn das Alignment schlampt, lernt das Netz Müll. Steck hier den meisten Aufwand rein.
+Der Datensatz ist so strukturiert (an dem orientierst du deinen eigenen):
+
+Synthetisch: ground-truth/ + simulations/ (Bildpaare)
+Real: pro Ground-Truth-Bild ein Ordner mit mehreren Captures (capture1_imageN.png … captureM_imageN.png) — mehrere Aufnahmen pro Motiv erhöhen die Robustheit.
+
+Meine klare Empfehlung für den Ablauf — in dieser Reihenfolge:
+
+Erst synthetisch, dann real. Das Repo enthält einen GNU-Radio-basierten Simulator, der aus einem beliebigen Bild das „erspähte" Signal erzeugt. Nutz ihn, um unbegrenzt perfekt ausgerichtete Trainingspaare zu generieren. Damit trainierst du ein solides Basismodell ohne einen einzigen echten Capture — und umgehst das Alignment-Problem komplett in Phase 1.
+Basismodell auf Synthetik trainieren (DRUNet aus dem end-to-end-Ordner, auf Patches, L1-Loss als Start).
+Auf deinen echten Captures fine-tunen. Jetzt baust du deinen eigenen Real-Datensatz mit deinem 445,5-MHz-Setup und passt das vortrainierte Modell an deine konkrete Hardware/Antenne/Umgebung an. Fine-Tuning braucht viel weniger saubere echte Paare als Training von Null.
+Evaluieren über CER (nicht nur PSNR/SSIM) — Tesseract ist genau dafür schon in der Umgebung. Da euer Ziel Lesbarkeit ist, ist die Zeichen-Fehlerrate die Metrik, die zählt.
+
+Das „Erst-synthetisch-dann-fine-tunen" ist der Hebel, der dir am meisten Zeit spart und das Alignment-Risiko am Anfang aushebelt.
+— am sinnvollsten wäre der Trainingsteil im end-to-end-Ordner: konkrete DRUNet-Konfiguration, Patch-Größe, Loss-Setup und wie du den Dataloader auf komplexe IQ-Kanäle statt RGB umstellst. Sag Bescheid, welchen Block du aufgemacht haben willst.
